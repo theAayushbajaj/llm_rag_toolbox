@@ -71,3 +71,39 @@ This method proposes using fine-grained units called "propositions"—atomic exp
 - Combining propositional breakdown with LLM-based chunking (agentic chunking) can optimize semantic coherence and retrieval performance.
 
 **Performance**: The method was evaluated using experiments on passage retrieval and downstream QA tasks across five datasets and six dense retrievers. Proposition-based retrieval consistently yielded higher recall and improved downstream QA performance.
+
+# Financial Report Chunking for Effective Retrieval Augmented Generation
+
+\[Antonio Jimeno Yepes, Yao You, Jan Milczek, Sebastian Laverde, Renyu Li (2024). Financial Report Chunking for Effective Retrieval Augmented Generation. arXiv:2402.05131\]
+
+**Technique**  
+The technique goes beyond traditional paragraph-level segmentation. Instead of using a fixed token or paragraph size, their method divides financial reports into meaningful structural elements (e.g., section headers, narrative texts, tables, figures, and footnotes). These elements are automatically annotated using document understanding models. By leveraging the inherent structure of financial documents, this element-based chunking method naturally produces chunks that preserve context without manual tuning of chunk sizes.
+
+**Key Components**
+
+- Element-Based Segmentation: Documents are dissected into constituent elements like headers, tables, figures, footnotes, and narrative texts. Each element serves as a natural segmentation boundary that reflects the document’s structure.
+
+- Annotation with Document Understanding Models: Structural elements are identified and annotated automatically. This annotation helps guide the chunking process so that each chunk preserves key contextual information.
+
+- Dynamic Chunk Size Determination: The approach yields optimal chunk sizes based on the natural boundaries present in the document. Eliminates the need for manual tuning of hyperparameters such as fixed token lengths.
+
+**Lessons Learned**
+
+- By chunking along natural document structures, the approach maintains semantic context that is often lost with uniform paragraph splitting.  
+- Improved context in each chunk leads to higher retrieval accuracy, as each segment more precisely represents a coherent idea.
+
+But,
+
+- If documents are poorly formatted or if the structural elements are inconsistent, the method may struggle to produce effective chunks.  
+- The accuracy of the underlying document understanding models is critical; misclassification of elements could result in suboptimal segmentation.  
+- While highly effective for structured financial documents, the technique might require adaptation for documents with less rigid or different structural formats.
+
+**Benchmarking**  
+The authors evaluated the performance of their element-based chunking method using three primary metrics on the financebench dataset:
+
+*Chunking Efficiency*: Measured by the total number of chunks produced. Compared against baseline methods (e.g., fixed token-length chunking) to assess the indexing and storage implications.
+
+*Retrieval Accuracy*: Evaluated by comparing the relevance of retrieved chunks to known evidence from financial reports. Metrics such as ROUGE and BLEU scores were used to quantify how closely the retrieved text matches the ground truth.
+
+*Q\&A Accuracy:* Assessed via both automatic evaluation (using an LLM such as GPT-4) and manual review.  
+The accuracy of the final generated answers in a retrieval-augmented question-answering task served as a key indicator of the overall effectiveness of the chunking method.
