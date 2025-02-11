@@ -107,3 +107,151 @@ The authors evaluated the performance of their element-based chunking method usi
 
 *Q\&A Accuracy:* Assessed via both automatic evaluation (using an LLM such as GPT-4) and manual review.  
 The accuracy of the final generated answers in a retrieval-augmented question-answering task served as a key indicator of the overall effectiveness of the chunking method.
+
+```python
+import re
+import time
+
+class LumberChunker:
+    def __init__(self, model_type, system_prompt, max_words=550):
+        """
+        Initialize the LumberChunker.
+        
+        Parameters:
+            model_type (str): Either "Gemini" or "ChatGPT".
+            system_prompt (str): The system prompt used to instruct the LLM.
+            max_words (int): Approximate maximum word count per chunk (default 550).
+        """
+        self.model_type = model_type
+        self.system_prompt = system_prompt
+        self.max_words = max_words
+
+    def count_words(self, text):
+        """Approximate token count using a 1.2 factor on word count."""
+        words = text.split()
+        return round(1.2 * len(words))
+
+    def LLM_prompt(self, user_prompt):
+        """
+        Call the LLM with the given prompt and return the output.
+        
+        This example assumes the existence of a global `model` (for Gemini) 
+        or `client` (for ChatGPT) along with necessary safety setting constants.
+        """
+        if self.model_type == "Gemini":
+            GenerationConfig = {"temperature": 0.1}
+            while True:
+                try:
+                    response = model.generate_content(
+                        contents=user_prompt,
+                        generation_config=GenerationConfig,
+                        safety_settings={
+                            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+                            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                        }
+                    )
+                    return response.candidates[0].content.parts[0].text
+                except Exception as e:
+                    if str(e) == "list index out of range":
+                        print("Gemini thinks prompt is unsafe")
+                        return "content_flag_increment"
+                    else:
+                        print(f"An error occurred: {e}. Retrying in 1 minute...")
+                        time.sleep(60)
+        elif self.model_type == "ChatGPT":
+            while True:
+                try:
+                    completion = client.chat.completions.create(
+                        model="gpt-3.5-turbo-0125",
+                        temperature=0.1,
+                        messages=[
+                            {"role": "system", "content": self.system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                    )
+                    return completion.choices[0].message.content
+                except Exception as e:
+                    if str(e) == "list index out of range":
+                        print("GPT thinks prompt is unsafe")
+                        return "content_flag_increment"
+                    else:
+                        print(f"An error occurred: {e}. Retrying in 1 minute...")
+                        time.sleep(60)
+
+    def segment(self, formatted_text):
+        """
+        Process the formatted text (with paragraphs labeled as "ID X: ...")
+        and return a list of semantically combined chunks.
+        
+        The method:
+          1. Splits the text into paragraphs.
+          2. Iteratively aggregates paragraphs until the approximate word count reaches max_words.
+          3. Uses an LLM call (with the system prompt and current text block) to determine where
+             the content shift occurs (i.e. which paragraph ID marks the beginning of a new semantic chunk).
+          4. Uses the returned ID to update boundaries and finally returns the combined chunks.
+        """
+        # Split the formatted text into paragraphs (each should already have an "ID X:" prefix)
+        paragraphs = [line for line in formatted_text.split("\n") if line.strip()]
+        new_id_list = []
+        chunk_number = 0
+
+        # Process paragraphs until near the end of the list.
+        while chunk_number < len(paragraphs) - 5:
+            word_count = 0
+            i = 0
+            # Aggregate paragraphs until reaching the max_words threshold.
+            while word_count < self.max_words and (i + chunk_number) < len(paragraphs) - 1:
+                i += 1
+                final_document = "\n".join(paragraphs[chunk_number:chunk_number + i])
+                word_count = self.count_words(final_document)
+            # Adjust the selection: if more than one paragraph was added, remove the last one.
+            if i == 1:
+                final_document = "\n".join(paragraphs[chunk_number:chunk_number + i])
+            else:
+                final_document = "\n".join(paragraphs[chunk_number:chunk_number + i - 1])
+            
+            # Prepare the prompt by appending the final document to the system prompt.
+            question = f"\nDocument:\n{final_document}"
+            prompt = self.system_prompt + question
+
+            # Get LLM output.
+            gpt_output = self.LLM_prompt(prompt)
+            
+            if gpt_output == "content_flag_increment":
+                chunk_number += 1
+            else:
+                # Look for the expected response format "Answer: ID XXXX"
+                pattern = r"Answer: ID \w+"
+                match = re.search(pattern, gpt_output)
+                if match is None:
+                    print("Could not parse response. Repeating iteration.")
+                else:
+                    gpt_output1 = match.group(0)
+                    print(gpt_output1)
+                    # Extract the numerical ID from the response.
+                    pattern_num = r'\d+'
+                    match_num = re.search(pattern_num, gpt_output1)
+                    if match_num:
+                        new_chunk = int(match_num.group())
+                        new_id_list.append(new_chunk)
+                        chunk_number = new_chunk
+                        # In case the returned chunk doesn't move us forward, increment manually.
+                        if new_id_list[-1] == chunk_number:
+                            chunk_number += 1
+                    else:
+                        chunk_number += 1
+        # Add the final boundary.
+        new_id_list.append(len(paragraphs))
+        
+        # Build the final chunks based on the determined boundaries.
+        final_chunks = []
+        prev_idx = 0
+        for idx in new_id_list:
+            chunk_text = "\n".join(paragraphs[prev_idx:idx])
+            final_chunks.append(chunk_text)
+            prev_idx = idx
+        return final_chunks
+
+```
