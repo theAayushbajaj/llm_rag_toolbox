@@ -109,149 +109,259 @@ The authors evaluated the performance of their element-based chunking method usi
 The accuracy of the final generated answers in a retrieval-augmented question-answering task served as a key indicator of the overall effectiveness of the chunking method.
 
 ```python
-import re
-import time
+import numpy as np
+from typing import List, Dict, Any, Optional
 
-class LumberChunker:
-    def __init__(self, model_type, system_prompt, max_words=550):
-        """
-        Initialize the LumberChunker.
-        
-        Parameters:
-            model_type (str): Either "Gemini" or "ChatGPT".
-            system_prompt (str): The system prompt used to instruct the LLM.
-            max_words (int): Approximate maximum word count per chunk (default 550).
-        """
-        self.model_type = model_type
-        self.system_prompt = system_prompt
-        self.max_words = max_words
+"""
+This module demonstrates a proof-of-concept for a semantic-based chunker.
 
-    def count_words(self, text):
-        """Approximate token count using a 1.2 factor on word count."""
-        words = text.split()
-        return round(1.2 * len(words))
+Steps:
+ 1. We split/segment the input text into preliminary units (e.g. paragraphs, lines, or sentences)
+ 2. We encode each preliminary unit with a sentence embedding model
+    (here we show a placeholder for the BAAI bge-large-1.5en model via HuggingFace transformers or sentence-transformers)
+ 3. We merge or split these units based on their semantic similarity scores
+    - We can do pairwise adjacency-based merges or cluster-based merges
+ 4. We decode the final chunk list back to the original textual content (with optional metadata like page numbers)
 
-    def LLM_prompt(self, user_prompt):
-        """
-        Call the LLM with the given prompt and return the output.
-        
-        This example assumes the existence of a global `model` (for Gemini) 
-        or `client` (for ChatGPT) along with necessary safety setting constants.
-        """
-        if self.model_type == "Gemini":
-            GenerationConfig = {"temperature": 0.1}
-            while True:
-                try:
-                    response = model.generate_content(
-                        contents=user_prompt,
-                        generation_config=GenerationConfig,
-                        safety_settings={
-                            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-                            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-                        }
-                    )
-                    return response.candidates[0].content.parts[0].text
-                except Exception as e:
-                    if str(e) == "list index out of range":
-                        print("Gemini thinks prompt is unsafe")
-                        return "content_flag_increment"
-                    else:
-                        print(f"An error occurred: {e}. Retrying in 1 minute...")
-                        time.sleep(60)
-        elif self.model_type == "ChatGPT":
-            while True:
-                try:
-                    completion = client.chat.completions.create(
-                        model="gpt-3.5-turbo-0125",
-                        temperature=0.1,
-                        messages=[
-                            {"role": "system", "content": self.system_prompt},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                    )
-                    return completion.choices[0].message.content
-                except Exception as e:
-                    if str(e) == "list index out of range":
-                        print("GPT thinks prompt is unsafe")
-                        return "content_flag_increment"
-                    else:
-                        print(f"An error occurred: {e}. Retrying in 1 minute...")
-                        time.sleep(60)
+This chunker is designed so that the final step yields text chunks ready for use in your RAG pipeline.
+We do not alter the rest of the pipeline—just produce new chunks that can be fed into a standard embedder.
+"""
 
-    def segment(self, formatted_text):
-        """
-        Process the formatted text (with paragraphs labeled as "ID X: ...")
-        and return a list of semantically combined chunks.
-        
-        The method:
-          1. Splits the text into paragraphs.
-          2. Iteratively aggregates paragraphs until the approximate word count reaches max_words.
-          3. Uses an LLM call (with the system prompt and current text block) to determine where
-             the content shift occurs (i.e. which paragraph ID marks the beginning of a new semantic chunk).
-          4. Uses the returned ID to update boundaries and finally returns the combined chunks.
-        """
-        # Split the formatted text into paragraphs (each should already have an "ID X:" prefix)
-        paragraphs = [line for line in formatted_text.split("\n") if line.strip()]
-        new_id_list = []
-        chunk_number = 0
+try:
+    from sentence_transformers import SentenceTransformer, util
+except ImportError:
+    raise ImportError("Please install sentence-transformers via pip install sentence-transformers")
 
-        # Process paragraphs until near the end of the list.
-        while chunk_number < len(paragraphs) - 5:
-            word_count = 0
-            i = 0
-            # Aggregate paragraphs until reaching the max_words threshold.
-            while word_count < self.max_words and (i + chunk_number) < len(paragraphs) - 1:
-                i += 1
-                final_document = "\n".join(paragraphs[chunk_number:chunk_number + i])
-                word_count = self.count_words(final_document)
-            # Adjust the selection: if more than one paragraph was added, remove the last one.
-            if i == 1:
-                final_document = "\n".join(paragraphs[chunk_number:chunk_number + i])
+
+class SemanticChunker:
+    def __init__(
+        self,
+        model_name: str = "BAAI/bge-large-en",
+        similarity_threshold: float = 0.6,
+    ):
+        """
+        Initialize the chunker with a chosen embedding model.
+
+        :param model_name: The HuggingFace/SentenceTransformer model name.
+        :param similarity_threshold: The threshold above which we merge similar chunks.
+        """
+        self.model = SentenceTransformer(model_name)
+        self.sim_threshold = similarity_threshold
+
+    def _compute_embeddings(self, segments: List[str]) -> np.ndarray:
+        """
+        Encodes each segment using the specified model, returns a numpy array.
+        """
+        embeddings = self.model.encode(segments, convert_to_numpy=True)
+        return embeddings
+
+    def _auto_hierarchical_cut(
+        self,
+        embeddings: np.ndarray,
+        method: str = "ward"
+    ) -> List[int]:
+        """
+        Automatically determine the number of clusters by detecting the largest jump
+        in the linkage distances, then partition the dendrogram at that distance.
+        """
+        import scipy.cluster.hierarchy as sch
+        from scipy.cluster.hierarchy import fcluster
+        # compute linkage matrix
+        Z = sch.linkage(embeddings, method=method)
+        # distances are in the 3rd column
+        distances = Z[:, 2]
+        # sort distances
+        sorted_distances = np.sort(distances)
+        # find biggest jump
+        diffs = np.diff(sorted_distances)
+        max_jump_idx = np.argmax(diffs)
+        cutoff_distance = sorted_distances[max_jump_idx]
+        # form clusters at that cutoff
+        labels = fcluster(Z, cutoff_distance, criterion='distance')
+        return labels.tolist()
+
+    def chunk(
+        self,
+        text_segments: List[str],
+        metadata: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Perform semantic chunking on a list of text segments.
+
+        :param text_segments: Preliminary list of text segments (e.g. sentences or paragraphs).
+        :param metadata: Optional parallel list of metadata dicts (e.g. page numbers). Must match length of text_segments.
+
+        :return: A list of dictionaries where each dict has:
+                 {
+                   'content': merged chunk text,
+                   'metadata': optional metadata about the chunk
+                 }
+        """
+        if not text_segments:
+            return []
+        if metadata and len(metadata) != len(text_segments):
+            raise ValueError("Metadata length must match text_segments length")
+        if len(text_segments) == 1:
+            return [{
+                'content': text_segments[0],
+                'metadata': metadata[0] if metadata else {}
+            }]
+
+        embeddings = self._compute_embeddings(text_segments)
+
+        # Adjacency-based merging
+        chunks = []
+        current_chunk = text_segments[0]
+        current_meta = metadata[0] if metadata else {}
+        current_embedding = embeddings[0]
+
+        for i in range(1, len(text_segments)):
+            sim = self._cosine_similarity(current_embedding, embeddings[i])
+            if sim >= self.sim_threshold:
+                current_chunk += "\n" + text_segments[i]
+                if metadata:
+                    current_meta = self._merge_metadata(current_meta, metadata[i])
+                current_embedding = (current_embedding + embeddings[i]) / 2.0
             else:
-                final_document = "\n".join(paragraphs[chunk_number:chunk_number + i - 1])
-            
-            # Prepare the prompt by appending the final document to the system prompt.
-            question = f"\nDocument:\n{final_document}"
-            prompt = self.system_prompt + question
+                chunks.append({
+                    'content': current_chunk,
+                    'metadata': current_meta
+                })
+                current_chunk = text_segments[i]
+                current_meta = metadata[i] if metadata else {}
+                current_embedding = embeddings[i]
 
-            # Get LLM output.
-            gpt_output = self.LLM_prompt(prompt)
-            
-            if gpt_output == "content_flag_increment":
-                chunk_number += 1
-            else:
-                # Look for the expected response format "Answer: ID XXXX"
-                pattern = r"Answer: ID \w+"
-                match = re.search(pattern, gpt_output)
-                if match is None:
-                    print("Could not parse response. Repeating iteration.")
+        chunks.append({
+            'content': current_chunk,
+            'metadata': current_meta
+        })
+
+        return chunks
+
+    def cluster(
+        self,
+        text_segments: List[str],
+        metadata: Optional[List[Dict[str, Any]]] = None,
+        linkage_method: str = "ward",
+        num_clusters: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Cluster-based approach using hierarchical clustering.
+        If num_clusters is not specified, automatically detect it by scanning the largest jump.
+
+        :param text_segments: Preliminary list of text segments.
+        :param metadata: Optional parallel list of metadata dicts.
+        :param linkage_method: e.g. 'ward', 'complete', 'average', etc.
+        :param num_clusters: If provided, uses that many clusters. Otherwise automatically determines them.
+
+        :return: A list of chunk dicts.
+        """
+        if metadata and len(metadata) != len(text_segments):
+            raise ValueError("Metadata length must match text_segments length")
+
+        embeddings = self._compute_embeddings(text_segments)
+
+        import scipy.cluster.hierarchy as sch
+        from scipy.cluster.hierarchy import fcluster
+
+        if num_clusters is None:
+            # auto-detect cluster count by largest jump in distances
+            labels = self._auto_hierarchical_cut(embeddings, method=linkage_method)
+        else:
+            # we do standard hierarchical with a fixed cluster count
+            Z = sch.linkage(embeddings, method=linkage_method)
+            labels = fcluster(Z, num_clusters, criterion='maxclust')
+
+        cluster_map = {}
+        for i, label in enumerate(labels):
+            if label not in cluster_map:
+                cluster_map[label] = {
+                    'content': [],
+                    'metadata': []
+                }
+            cluster_map[label]['content'].append(text_segments[i])
+            if metadata:
+                cluster_map[label]['metadata'].append(metadata[i])
+
+        chunks = []
+        for label, data in cluster_map.items():
+            merged_text = "\n".join(data['content'])
+            merged_meta = self._merge_metadata_list(data['metadata'])
+            chunks.append({
+                'content': merged_text,
+                'metadata': merged_meta
+            })
+        return chunks
+
+    def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
+        return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+    def _merge_metadata(self, meta_a: Dict[str, Any], meta_b: Dict[str, Any]) -> Dict[str, Any]:
+        """Example metadata merging function. Customize as needed."""
+        merged = dict(meta_a)
+        for k, v in meta_b.items():
+            if k in merged:
+                if k == 'page_number':
+                    pages = set()
+                    if isinstance(merged[k], int):
+                        pages.add(merged[k])
+                    elif isinstance(merged[k], list):
+                        pages.update(merged[k])
+                    pages.add(v)
+                    merged[k] = sorted(list(pages))
                 else:
-                    gpt_output1 = match.group(0)
-                    print(gpt_output1)
-                    # Extract the numerical ID from the response.
-                    pattern_num = r'\d+'
-                    match_num = re.search(pattern_num, gpt_output1)
-                    if match_num:
-                        new_chunk = int(match_num.group())
-                        new_id_list.append(new_chunk)
-                        chunk_number = new_chunk
-                        # In case the returned chunk doesn't move us forward, increment manually.
-                        if new_id_list[-1] == chunk_number:
-                            chunk_number += 1
-                    else:
-                        chunk_number += 1
-        # Add the final boundary.
-        new_id_list.append(len(paragraphs))
-        
-        # Build the final chunks based on the determined boundaries.
-        final_chunks = []
-        prev_idx = 0
-        for idx in new_id_list:
-            chunk_text = "\n".join(paragraphs[prev_idx:idx])
-            final_chunks.append(chunk_text)
-            prev_idx = idx
-        return final_chunks
+                    merged[k] = v
+            else:
+                merged[k] = v
+        return merged
+
+    def _merge_metadata_list(self, metas: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not metas:
+            return {}
+        combined = dict(metas[0])
+        for m in metas[1:]:
+            combined = self._merge_metadata(combined, m)
+        return combined
+
+
+def example_usage():
+    text = [
+        "This is a brief introduction about cats.",
+        "Cats are very popular pets.",
+        "Now let's talk about nuclear physics.",
+        "Dogs are also popular, they bark.",
+        "Nuclear physics deals with atomic nuclei.",
+        "Some details on cat breeds include Persian and Siamese.",
+        "Atomic particles like protons and neutrons are relevant.",
+    ]
+
+    metadata = [
+        {'page_number': 1},
+        {'page_number': 1},
+        {'page_number': 2},
+        {'page_number': 3},
+        {'page_number': 2},
+        {'page_number': 4},
+        {'page_number': 2},
+    ]
+
+    chunker = SemanticChunker(model_name="BAAI/bge-large-en", similarity_threshold=0.55)
+    adjacency_chunks = chunker.chunk(text, metadata)
+    print("Adjacency-based merging result:")
+    for ch in adjacency_chunks:
+        print(ch)
+        print("-" * 40)
+
+    # Example hierarchical approach
+    # If no num_clusters is given, the algorithm will auto-detect them via largest jump
+    cluster_chunks = chunker.cluster(text, metadata, linkage_method="ward")
+    print("\nHierarchical clustering result (auto-detected clusters):")
+    for ch in cluster_chunks:
+        print(ch)
+        print("-" * 40)
+
+
+if __name__ == "__main__":
+    example_usage()
 
 ```
