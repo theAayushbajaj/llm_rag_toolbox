@@ -118,7 +118,7 @@ This module demonstrates a proof-of-concept for a semantic-based chunker.
 Steps:
  1. We split/segment the input text into preliminary units (e.g. paragraphs, lines, or sentences)
  2. We encode each preliminary unit with a sentence embedding model
-    (here we show a placeholder for the BAAI bge-large-1.5en model via HuggingFace transformers or sentence-transformers)
+    (using the BAAI bge-large-1.5en model via HuggingFace transformers or sentence-transformers)
  3. We merge or split these units based on their semantic similarity scores
     - We can do pairwise adjacency-based merges or cluster-based merges
  4. We decode the final chunk list back to the original textual content (with optional metadata like page numbers)
@@ -134,25 +134,41 @@ except ImportError:
 
 
 class SemanticChunker:
+    # Consider lazy loading or embedding caching to avoid repeated model initializations for large inputs.
+    _global_model = None  # class-level reference for lazy loading
+
     def __init__(
         self,
-        model_name: str = "BAAI/bge-large-en",
+        model_name: str = "./BAAI_bge-large-en-v1.5",  # local path
         similarity_threshold: float = 0.6,
     ):
         """
         Initialize the chunker with a chosen embedding model.
-
-        :param model_name: The HuggingFace/SentenceTransformer model name.
+        :param model_name: The path or name for the local BAAI/bge-large-en model.
         :param similarity_threshold: The threshold above which we merge similar chunks.
         """
-        self.model = SentenceTransformer(model_name)
+        self.model_name = model_name
         self.sim_threshold = similarity_threshold
+
+    def _lazy_load_model(self) -> SentenceTransformer:
+        """
+        Lazily load the SentenceTransformer model only once at the class level.
+        This helps avoid repeated initializations for large volumes of data.
+        """
+        if SemanticChunker._global_model is None:
+            # Load model from local dir
+            SemanticChunker._global_model = SentenceTransformer(
+                self.model_name,
+                local_files_only=True  # ensure we only use local files
+            )
+        return SemanticChunker._global_model
 
     def _compute_embeddings(self, segments: List[str]) -> np.ndarray:
         """
         Encodes each segment using the specified model, returns a numpy array.
         """
-        embeddings = self.model.encode(segments, convert_to_numpy=True)
+        model = self._lazy_load_model()
+        embeddings = model.encode(segments, convert_to_numpy=True)
         return embeddings
 
     def _auto_hierarchical_cut(
@@ -166,17 +182,13 @@ class SemanticChunker:
         """
         import scipy.cluster.hierarchy as sch
         from scipy.cluster.hierarchy import fcluster
-        # compute linkage matrix
+
         Z = sch.linkage(embeddings, method=method)
-        # distances are in the 3rd column
         distances = Z[:, 2]
-        # sort distances
         sorted_distances = np.sort(distances)
-        # find biggest jump
         diffs = np.diff(sorted_distances)
         max_jump_idx = np.argmax(diffs)
         cutoff_distance = sorted_distances[max_jump_idx]
-        # form clusters at that cutoff
         labels = fcluster(Z, cutoff_distance, criterion='distance')
         return labels.tolist()
 
@@ -188,14 +200,9 @@ class SemanticChunker:
         """
         Perform semantic chunking on a list of text segments.
 
-        :param text_segments: Preliminary list of text segments (e.g. sentences or paragraphs).
-        :param metadata: Optional parallel list of metadata dicts (e.g. page numbers). Must match length of text_segments.
-
-        :return: A list of dictionaries where each dict has:
-                 {
-                   'content': merged chunk text,
-                   'metadata': optional metadata about the chunk
-                 }
+        :param text_segments: Preliminary list of text segments.
+        :param metadata: Optional parallel list of metadata dicts. Must match length.
+        :return: A list of dicts with 'content' and 'metadata'.
         """
         if not text_segments:
             return []
@@ -209,7 +216,6 @@ class SemanticChunker:
 
         embeddings = self._compute_embeddings(text_segments)
 
-        # Adjacency-based merging
         chunks = []
         current_chunk = text_segments[0]
         current_meta = metadata[0] if metadata else {}
@@ -248,13 +254,6 @@ class SemanticChunker:
         """
         Cluster-based approach using hierarchical clustering.
         If num_clusters is not specified, automatically detect it by scanning the largest jump.
-
-        :param text_segments: Preliminary list of text segments.
-        :param metadata: Optional parallel list of metadata dicts.
-        :param linkage_method: e.g. 'ward', 'complete', 'average', etc.
-        :param num_clusters: If provided, uses that many clusters. Otherwise automatically determines them.
-
-        :return: A list of chunk dicts.
         """
         if metadata and len(metadata) != len(text_segments):
             raise ValueError("Metadata length must match text_segments length")
@@ -265,10 +264,8 @@ class SemanticChunker:
         from scipy.cluster.hierarchy import fcluster
 
         if num_clusters is None:
-            # auto-detect cluster count by largest jump in distances
             labels = self._auto_hierarchical_cut(embeddings, method=linkage_method)
         else:
-            # we do standard hierarchical with a fixed cluster count
             Z = sch.linkage(embeddings, method=linkage_method)
             labels = fcluster(Z, num_clusters, criterion='maxclust')
 
@@ -345,7 +342,7 @@ def example_usage():
         {'page_number': 2},
     ]
 
-    chunker = SemanticChunker(model_name="BAAI/bge-large-en", similarity_threshold=0.55)
+    chunker = SemanticChunker(model_name="./BAAI_bge-large-en-v1.5", similarity_threshold=0.55)
     adjacency_chunks = chunker.chunk(text, metadata)
     print("Adjacency-based merging result:")
     for ch in adjacency_chunks:
@@ -353,7 +350,6 @@ def example_usage():
         print("-" * 40)
 
     # Example hierarchical approach
-    # If no num_clusters is given, the algorithm will auto-detect them via largest jump
     cluster_chunks = chunker.cluster(text, metadata, linkage_method="ward")
     print("\nHierarchical clustering result (auto-detected clusters):")
     for ch in cluster_chunks:
@@ -363,5 +359,94 @@ def example_usage():
 
 if __name__ == "__main__":
     example_usage()
+
+class Document:
+    def __init__(self, chunk: str, metadata: dict):
+        self.chunk = chunk
+        self.metadata = metadata
+
+
+def semantic_chunkify(
+    docs: List[Document],
+    model_name: str = "BAAI/bge-large-en",
+    similarity_threshold: float = 0.60
+) -> List[Document]:
+    """
+    Takes in a list of Document objects (with doc.chunk and doc.metadata),
+    performs adjacency-based semantic chunking, and returns new Documents
+    that combine text segments (chunks) based on the specified similarity_threshold.
+    """
+    # 1) Extract the text segments and metadata
+    text_segments = [doc.chunk for doc in docs]
+    metadata_list = [doc.metadata for doc in docs]
+
+    # 2) Perform adjacency-based semantic chunking
+    chunker = SemanticChunker(
+        model_name=model_name,
+        similarity_threshold=similarity_threshold
+    )
+    merged_chunks = chunker.chunk(text_segments, metadata_list)
+
+    # 3) Build new Document objects
+    new_docs = []
+    for merged in merged_chunks:
+        new_docs.append(Document(
+            chunk=merged["content"],
+            metadata=merged["metadata"]
+        ))
+    return new_docs
+
+
+def semantic_clusterify(
+    docs: List[Document],
+    model_name: str = "BAAI/bge-large-en",
+    clustering_method: str = "agglomerative",
+    num_clusters: int = 5
+) -> List[Document]:
+    """
+    Demonstrates how to cluster text segments first, then treat each cluster as a new chunk.
+    For example, 'kmeans' or 'agglomerative' can be used. 
+    """
+    text_segments = [doc.chunk for doc in docs]
+    metadata_list = [doc.metadata for doc in docs]
+
+    # Use the same chunker but call .cluster() instead
+    chunker = SemanticChunker(model_name=model_name)
+    cluster_chunks = chunker.cluster(
+        text_segments,
+        metadata_list,
+        clustering_method=clustering_method,
+        num_clusters=num_clusters
+    )
+
+    new_docs = []
+    for merged in cluster_chunks:
+        new_docs.append(Document(
+            chunk=merged["content"],
+            metadata=merged["metadata"]
+        ))
+    return new_docs
+
+# Suppose you have a list of Document objects derived from PyMuPDF parsing
+pdf_docs = [
+    Document(chunk="Paragraph 1 text...", metadata={"page_number": 1}),
+    Document(chunk="Paragraph 2 text...", metadata={"page_number": 1}),
+    Document(chunk="Paragraph 3 text...", metadata={"page_number": 2}),
+    # ... more ...
+]
+
+# 1) Adjacency-based merging
+adj_merged_docs = semantic_chunkify(pdf_docs, similarity_threshold=0.55)
+for doc in adj_merged_docs:
+    print(doc.chunk)
+    print(doc.metadata)
+    print("-------")
+
+# 2) Cluster-based merging
+clustered_docs = semantic_clusterify(pdf_docs, num_clusters=3)
+for doc in clustered_docs:
+    print(doc.chunk)
+    print(doc.metadata)
+    print("-------")
 
 ```
